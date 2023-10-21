@@ -104,6 +104,7 @@ pub enum Category {
     LeftCurlyBracket,           // {
     RightCurlyBracket,          // }
     Comma,                      // ,
+    Hash,                       // #
     Dot,                        // .
     Percent,                    // %
     Semicolon,                  // ;
@@ -141,10 +142,8 @@ pub enum Category {
     GreaterGreaterGreater,      // >>>
     GreaterGreaterEqual,        // >>=
     LessLessEqual,              // <<=
-    LessLessLess,               // <<<
     GreaterBangLess,            // >!<
     GreaterGreaterGreaterEqual, // >>>=
-    LessLessLessEqual,          // <<<=
     String(StringCategory),     // "...\", multiline
     Number(Base),
     IllegalNumber(Base),
@@ -263,9 +262,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     // we break out of the macro since < can be parsed to:
-    // <<<
     // <<=
-    // <<<=
     // most operators don't have triple or tuple variant
     #[inline(always)]
     fn tokenize_less(&mut self) -> Option<Token> {
@@ -281,19 +278,6 @@ impl<'a> Tokenizer<'a> {
                 self.cursor.advance();
                 let next = self.cursor.peek(0);
                 match next {
-                    '<' => {
-                        self.cursor.advance();
-                        if self.cursor.peek(0) == '=' {
-                            self.cursor.advance();
-                            return single_token!(
-                                LessLessLessEqual,
-                                start,
-                                self.cursor.len_consumed()
-                            );
-                        }
-
-                        single_token!(LessLessLess, start, self.cursor.len_consumed())
-                    }
                     '=' => {
                         self.cursor.advance();
                         single_token!(LessLessEqual, start, self.cursor.len_consumed())
@@ -373,6 +357,8 @@ impl<'a> Tokenizer<'a> {
                 self.cursor.advance();
                 self.cursor.skip_while(base.verifier());
             }
+            // we verify that the cursor actually moved to prevent scenarious like
+            // 0b without any actual number in it
             if start == self.cursor.len_consumed() {
                 single_token!(Category::IllegalNumber(base), start, start)
             } else {
@@ -380,44 +366,6 @@ impl<'a> Tokenizer<'a> {
             }
         } else {
             single_token!(Category::UnknownBase, start, self.cursor.len_consumed())
-        }
-    }
-
-    // checks if a starting slash is either an operator or a comment
-    #[inline(always)]
-    pub fn tokenize_slash(&mut self, start: usize) -> Option<Token> {
-        match self.cursor.peek(0) {
-            '=' => {
-                self.cursor.advance();
-                single_token!(Category::SlashEqual, start, self.cursor.len_consumed())
-            }
-            '/' => {
-                self.cursor.skip_while(|c| c != '\n');
-                single_token!(Category::Comment, start, self.cursor.len_consumed())
-            }
-            '*' => {
-                let mut comments = 1;
-                while comments > 0 {
-                    self.cursor.skip_while(|c| c != '*' && c != '/');
-                    self.cursor.advance();
-                    // handles nested multiline comments
-                    if let Some(c) = self.cursor.advance() {
-                        if c == '/' {
-                            comments -= 1;
-                        } else if c == '*' {
-                            comments += 1;
-                        }
-                    } else {
-                        return single_token!(
-                            Category::Unclosed(UnclosedCategory::Comment),
-                            start,
-                            self.cursor.len_consumed()
-                        );
-                    }
-                }
-                single_token!(Category::Comment, start, self.cursor.len_consumed())
-            }
-            _ => single_token!(Category::Slash, start, self.cursor.len_consumed()),
         }
     }
 
@@ -473,11 +421,15 @@ impl<'a> Iterator for Tokenizer<'a> {
             '}' => single_token!(RightCurlyBracket, start, self.cursor.len_consumed()),
             ',' => single_token!(Comma, start, self.cursor.len_consumed()),
             '.' => single_token!(Dot, start, self.cursor.len_consumed()),
+            '#' => {
+                self.cursor.skip_while(|c| c != '\n');
+                single_token!(Category::Comment, start, self.cursor.len_consumed())
+            },
             '-' => double_token!(self.cursor, start, Minus, '-', MinusMinus, '=', MinusEqual),
             '+' => double_token!(self.cursor, start, Plus, '+', PlusPlus, '=', PlusEqual),
             '%' => single_token!(Percent, start, self.cursor.len_consumed()),
             ';' => single_token!(Semicolon, start, self.cursor.len_consumed()),
-            '/' => self.tokenize_slash(start),
+            '/' => double_token!(self.cursor, start, Slash, '=', SlashEqual), //self.tokenize_slash(start),
             '*' => double_token!(self.cursor, start, Star, '*', StarStar, '=', StarEqual),
             ':' => single_token!(DoublePoint, start, self.cursor.len_consumed()),
             '~' => single_token!(Tilde, start, self.cursor.len_consumed()),
@@ -596,12 +548,10 @@ mod tests {
         verify_tokens!(">>=", vec![(Category::GreaterGreaterEqual, 0, 3)]);
         verify_tokens!(">!<", vec![(Category::GreaterBangLess, 0, 3)]);
         verify_tokens!("<<=", vec![(Category::LessLessEqual, 0, 3)]);
-        verify_tokens!("<<<", vec![(Category::LessLessLess, 0, 3)]);
     }
 
     #[test]
     fn four_tuple_tokens() {
-        verify_tokens!("<<<=", vec![(Category::LessLessLessEqual, 0, 4)]);
         verify_tokens!(">>>=", vec![(Category::GreaterGreaterGreaterEqual, 0, 4)]);
     }
 
@@ -667,36 +617,8 @@ mod tests {
     fn single_line_comments() {
         use Category::*;
         verify_tokens!(
-            "// this is a comment\n;",
-            vec![(Comment, 0, 20), (Semicolon, 21, 22)]
-        );
-    }
-
-    #[test]
-    fn multi_line_comments() {
-        use Category::*;
-        verify_tokens!("/*\n\nthis\nis\na\ncomment\n\n*/", vec![(Comment, 0, 25)]);
-        let code = r"
-        /*
-         * This is very important:
-         /*
-          * Therefore I do multiple comments inside
-          /* comment blocks */
-         */
-        */
-        ";
-        verify_tokens!(code, vec![(Comment, 9, 164)]);
-        verify_tokens!(
-            r"
-        /*
-         * This is very important:
-         /*
-          * Therefore I do multiple comments inside
-          /* comment blocks but I forgot to close one
-         */
-        */
-        ",
-            vec![(Unclosed(UnclosedCategory::Comment), 9, 196)]
+            "# this is a comment\n;",
+            vec![(Comment, 0, 19), (Semicolon, 20, 21)]
         );
     }
 
